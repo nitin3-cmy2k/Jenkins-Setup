@@ -1,0 +1,124 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-ubuntu-storageclass
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: jenkins-agent-pv
+spec:
+  capacity:
+    storage: 4.5G
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-ubuntu-storageclass
+  local:
+    path: /mnt/disks/jenkins-agent 
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - ubuntu
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-agent-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-ubuntu-storageclass
+  resources:
+    requests:
+      storage: 4.5G
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jenkins-agent
+  labels:
+    role: jenkins-agent
+spec:
+  # Hostname affinity to target 'ubuntu' node
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - ubuntu
+
+  # Tolerations for control plane taints
+  tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+  containers:
+    # 1. The SSH Agent Server
+  - name: jenkins-ssh-agent
+    image: jenkins/ssh-agent:alpine-jdk21
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        # 1. Install packages
+        apk add --no-cache docker-cli kubectl
+        
+        # 2. Configure SSH securely without blocking execution
+        echo "jenkins:root" | chpasswd
+        sed "-i" 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sed "-i" 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/' /etc/ssh/sshd_config
+        
+        # 3. Hand over control to the official entrypoint script
+        exec /usr/local/bin/setup-sshd
+    ports:
+    - containerPort: 22
+      name: ssh
+    securityContext:
+      capabilities:
+        add:
+        - SYS_CHROOT    
+    env:
+    - name: DOCKER_HOST
+      value: tcp://localhost:2376
+    - name: DOCKER_TLS_VERIFY
+      value: "1"
+    - name: DOCKER_CERT_PATH
+      value: /certs/client
+    volumeMounts:
+    - name: dind-certs
+      mountPath: /certs
+    - name: shared-workspace
+      mountPath: /home/jenkins/agent
+
+    # 2. The Separate, Standalone Docker Engine
+  - name: dind-daemon
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: /certs
+    volumeMounts:
+    - name: dind-certs
+      mountPath: /certs
+    - name: shared-workspace
+      mountPath: /home/jenkins/agent
+
+  volumes:
+  - name: dind-certs
+    emptyDir: {}
+  - name: shared-workspace
+    persistentVolumeClaim:
+      claimName: jenkins-agent-pvc
+
